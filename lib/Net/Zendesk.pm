@@ -2,8 +2,10 @@ package Net::Zendesk;
 use strict;
 use warnings;
 use MIME::Base64;
+use JSON::MaybeXS;
 
-our $VERSION = '0.01';
+our $VERSION = '0.03';
+our $result;
 
 sub new {
     my ($class, %args) = @_;
@@ -41,14 +43,99 @@ sub create_ticket {
     return $self->make_request('POST', $path, { ticket => $ticket });
 }
 
+sub show_ticket {
+    my ($self, $id) = @_;
+    return(undef) if !defined($id);
+    my $path = 'tickets/' . $id . '.json';
+    return $self->make_request('GET', $path, {});
+}
+
+sub update_ticket {
+    my ($self, $id, $ticket) = @_;
+    return(undef) if !defined($id);
+    my $path = 'tickets/' . $id . '.json';
+    return $self->make_request('PUT', $path, { ticket => $ticket });
+}
+
+sub add_ticket_comment {
+    my ($self, $id, $comment) = @_;
+    return(undef) if !defined($id);
+    my $path = 'tickets/' . $id . '.json';
+    return $self->make_request('PUT', $path, { ticket => { comment => $comment } });
+}
+
+sub create_user {
+    my ($self, $user, %extra) = @_;
+    my $path = 'users.json';
+    if (%extra) {
+        $path .= '?' . join('&', map("$_=$extra{$_}", keys %extra));
+    }
+    return $self->make_request('POST', $path, { user => $user });
+}
+
+sub create_or_update_user {
+    my ($self, $user, %extra) = @_;
+    my $path = 'users/create_or_update.json';
+    if (%extra) {
+        $path .= '?' . join('&', map("$_=$extra{$_}", keys %extra));
+    }
+    return $self->make_request('POST', $path, { user => $user });
+}
+
+sub update_user {
+    my ($self, $id, $user) = @_;
+    return(undef) if !defined($id);
+    my $path = 'users/' . $id . '.json';
+    return $self->make_request('PUT', $path, { user => $user });
+}
+
+sub show_user {
+    my ($self, $id) = @_;
+    return(undef) if !defined($id);
+    my $path = 'users/' . $id . '.json';
+    return $self->make_request('GET', $path, {});
+}
+
+sub merge_user {
+    my ($self, $id1, $id2) = @_;
+    return(undef) if (!defined($id1) || !defined($id2));
+    my $path = 'users/' . $id2 . '/merge.json';
+    return $self->make_request('PUT', $path, { user => { id => $id1 }});
+}
+
 sub search {
-    my ($self, $search_args) = @_;
+    my ($self, $search_args, $page) = @_;
     my $parsed_args = $self->_parse_search_args($search_args);
 
     require URI::Escape;
     my $query = URI::Escape::uri_escape(join(' ' => @$parsed_args));
+    my $path='search.json?';
+    $path .= 'page=' . $page . '&' if ($page);
+    $path .= 'query=' . $query;
 
-    return $self->make_request('GET', 'search.json?query=' . $query, {});
+    return $self->make_request('GET', $path, {});
+}
+
+sub search_next {
+    my ($self, $lastresult) = @_;
+
+    if ($lastresult && $lastresult->{next_page}) {
+	$result=$self->_ua->get($lastresult->{next_page});
+	return($result ? decode_json($result->decoded_content) : undef);
+    } else {
+	return undef;
+    }
+}
+
+sub search_prev {
+    my ($self, $lastresult) = @_;
+
+    if ($lastresult && $lastresult->{prev_page}) {
+	$result=$self->_ua->get($lastresult->{prev_page});
+	return($result ? decode_json($result->decoded_content) : undef);
+    } else {
+	return undef;
+    }
 }
 
 sub make_request {
@@ -58,84 +145,89 @@ sub make_request {
     die 'please provide a relative path' unless $path && $path !~ m{\A/api};
     die 'please provide a HASHREF with parameters' unless $params && ref $params eq 'HASH';
     my $method = lc $type;
-    return $self->_ua->$method(
+    $result=$self->_ua->$method(
         'https://' . $self->{_domain} . '/api/v2/' . $path,
         [
             ($method eq 'post' || $method eq 'put'
                 ? ('Content-Type' => 'application/json') : ()
             ),
         ],
-        $params,
+        encode_json($params),
     );
+    return($result ? decode_json($result->decoded_content) : undef);
 }
 
 sub _parse_search_args {
     my ($self, $search_args) = @_;
     my @query;
-    foreach my $keyword (keys %$search_args) {
-        die "Net::Zendesk: malformed search keyword '$keyword' contains spaces"
-            if $keyword =~ /\s/;
-        my $value = $search_args->{$keyword};
-        if (ref $value) {
-            if (ref $value eq 'HASH') {
-                foreach my $inner_key (keys %$value) {
-                    my %tokens = (
-                        '='   => ':',
-                        '>'   => '>',
-                        '<'   => '<',
-                        '>='  => '>=',
-                        '<='  => '<=',
-                        '!='  => ':',
-                        'or'  => ':',
-                        'and' => ':',
-                    );
-                    die "Net::Zendesk: invalid token '$inner_key' for keyword '$keyword'. Available tokens are " . join(', ', keys %tokens) unless exists $tokens{$inner_key};
+    if (ref $search_args eq 'HASH') {
+	    foreach my $keyword (keys %$search_args) {
+		die "Net::Zendesk: malformed search keyword '$keyword' contains spaces"
+		    if $keyword =~ /\s/;
+		my $value = $search_args->{$keyword};
+		if (ref $value) {
+		    if (ref $value eq 'HASH') {
+			foreach my $inner_key (keys %$value) {
+			    my %tokens = (
+				'='   => ':',
+				'>'   => '>',
+				'<'   => '<',
+				'>='  => '>=',
+				'<='  => '<=',
+				'!='  => ':',
+				'or'  => ':',
+				'and' => ':',
+			    );
+			    die "Net::Zendesk: invalid token '$inner_key' for keyword '$keyword'. Available tokens are " . join(', ', keys %tokens) unless exists $tokens{$inner_key};
 
-                    my $inner_value = $value->{$inner_key};
-                    $inner_value = 'none' unless defined $inner_value;
+			    my $inner_value = $value->{$inner_key};
+			    $inner_value = 'none' unless defined $inner_value;
 
-                    if (ref $inner_value) {
-                        die 'Net::Zendesk: only scalar values or ARRAY references are supported. Got ' . ref($inner_value) . " for keyword '$keyword' under '$inner_key'." unless ref $inner_value eq 'ARRAY';
-                        if ($inner_key eq 'and') {
-                            push @query, $keyword . ':'
-                            . join ' ', map {
-                                defined $_ ? $_ =~ /\s/ ? qq("$_") : $_ : 'none'
-                            } @$inner_value;
-                        }
-                        elsif ($inner_key eq '=' || $inner_key eq 'or') {
-                            foreach my $or (@$inner_value) {
-                                $or = 'none' unless defined $or;
-                                $or = qq("$or") if $or =~ /\s/;
-                                push @query, "$keyword$tokens{$inner_key}$or";
-                            }
-                        }
-                        else {
-                            die 'Net::Zendesk: only =,and,or tokens are allowed for references';
-                        }
-                    }
-                    else {
-                        $inner_value = qq("$inner_value") if $inner_value =~ /\s/;
-                        push @query, ($inner_key eq '!=' ? '-' : '')
-                                . "$keyword$tokens{$inner_key}$inner_value";
-                            }
-                }
-            }
-            elsif (ref $value eq 'ARRAY') {
-                foreach my $or (@$value) {
-                    $or = 'none' unless defined $or;
-                    $or = qq("$or") if $or =~ /\s/;
-                    push @query, "$keyword:$or";
-                }
-            }
-            else {
-                die 'Net::Zendesk: unsuported reference ' . ref($value) . '. Please use either a scalar or an ARRAY/HASH reference as a value for ' . $keyword;
-            }
-        }
-        else {
-            $value = 'none' unless defined $value;
-            $value = qq("$value") if $value =~ /\s/;
-            push @query, "$keyword:$value";
-        }
+			    if (ref $inner_value) {
+				die 'Net::Zendesk: only scalar values or ARRAY references are supported. Got ' . ref($inner_value) . " for keyword '$keyword' under '$inner_key'." unless ref $inner_value eq 'ARRAY';
+				if ($inner_key eq 'and') {
+				    push @query, $keyword . ':'
+				    . join ' ', map {
+					defined $_ ? $_ =~ /\s/ ? qq("$_") : $_ : 'none'
+				    } @$inner_value;
+				}
+				elsif ($inner_key eq '=' || $inner_key eq 'or') {
+				    foreach my $or (@$inner_value) {
+					$or = 'none' unless defined $or;
+					$or = qq("$or") if $or =~ /\s/;
+					push @query, "$keyword$tokens{$inner_key}$or";
+				    }
+				}
+				else {
+				    die 'Net::Zendesk: only =,and,or tokens are allowed for references';
+				}
+			    }
+			    else {
+				$inner_value = qq("$inner_value") if $inner_value =~ /\s/;
+				push @query, ($inner_key eq '!=' ? '-' : '')
+					. "$keyword$tokens{$inner_key}$inner_value";
+				    }
+			}
+		    }
+		    elsif (ref $value eq 'ARRAY') {
+			foreach my $or (@$value) {
+			    $or = 'none' unless defined $or;
+			    $or = qq("$or") if $or =~ /\s/;
+			    push @query, "$keyword:$or";
+			}
+		    }
+		    else {
+			die 'Net::Zendesk: unsuported reference ' . ref($value) . '. Please use either a scalar or an ARRAY/HASH reference as a value for ' . $keyword;
+		    }
+		}
+		else {
+		    $value = 'none' unless defined $value;
+		    $value = qq("$value") if $value =~ /\s/;
+		    push @query, "$keyword:$value";
+		}
+	    }
+    } else {
+	push @query, $search_args;
     }
     return \@query;
 }
